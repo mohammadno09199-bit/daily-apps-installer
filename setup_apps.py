@@ -2,378 +2,564 @@
 # -*- coding: utf-8 -*-
 
 """
-Cross-platform CLI app installer (Windows: winget, Linux: apt)
-- Interactive selection menu
-- Presets
-- Logging
-- Preflight checks
-- Continues on errors
+Post-install app setup
+Windows 10/11: winget
+Debian-based Linux: apt
 
-Usage examples:
+Python 3.8+
+
+Examples:
   python setup_apps.py
-  python setup_apps.py --preset daily
   python setup_apps.py --list
-  python setup_apps.py --install chrome 7zip vlc
-  python setup_apps.py --dry-run --preset daily
+  python setup_apps.py --preset daily --dry-run
+  python setup_apps.py --install chrome vlc git --yes
+  python setup_apps.py --settings restore-point fast-startup-off show-extensions
 """
 
-from __future__ import annotations
-
 import argparse
-import datetime as dt
+import ctypes
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
-from typing import Dict, List, Tuple
+import tempfile
+from pathlib import Path
 
 
-# -------------------------
-# Package catalogs
-# -------------------------
-
-# Each entry: key -> (Human name, installer_id_or_pkgname)
-WINDOWS_CATALOG: Dict[str, Tuple[str, str]] = {
-    "7zip": ("7-Zip", "7zip.7zip"),
-    "chrome": ("Google Chrome", "Google.Chrome"),
-    "brave": ("Brave", "Brave.Brave"),
-    "firefox": ("Mozilla Firefox", "Mozilla.Firefox"),
-    "vlc": ("VLC Media Player", "VideoLAN.VLC"),
-    "potplayer": ("PotPlayer", "Daum.PotPlayer"),
-    "telegram": ("Telegram Desktop", "Telegram.TelegramDesktop"),
-    "notepadpp": ("Notepad++", "Notepad++.Notepad++"),
-    "sumatra": ("SumatraPDF", "SumatraPDF.SumatraPDF"),
-    "foxit": ("Foxit PDF Reader", "Foxit.FoxitReader"),
-    "anydesk": ("AnyDesk", "AnyDeskSoftwareGmbH.AnyDesk"),
+# (Display name, winget ID or None, apt package candidates)
+# None means the application is not offered on that platform by this script.
+APPS = {
+    "7zip":         ("7-Zip",                  "7zip.7zip",                       ("7zip", "p7zip-full")),
+    "chrome":       ("Google Chrome",          "Google.Chrome",                   None),
+    "brave":        ("Brave",                  "Brave.Brave",                    None),
+    "firefox":      ("Firefox",                "Mozilla.Firefox",                 ("firefox-esr", "firefox")),
+    "chromium":     ("Chromium",               None,                              ("chromium", "chromium-browser")),
+    "vlc":          ("VLC",                    "VideoLAN.VLC",                    ("vlc",)),
+    "potplayer":    ("PotPlayer",              "Daum.PotPlayer",                  None),
+    "telegram":     ("Telegram Desktop",       "Telegram.TelegramDesktop",        ("telegram-desktop",)),
+    "notepadpp":    ("Notepad++",              "Notepad++.Notepad++",             None),
+    "geany":        ("Geany",                  None,                              ("geany",)),
+    "sumatra":      ("SumatraPDF",             "SumatraPDF.SumatraPDF",           None),
+    "evince":       ("Evince PDF Reader",      None,                              ("evince",)),
+    "libreoffice":  ("LibreOffice",            "TheDocumentFoundation.LibreOffice", ("libreoffice",)),
+    "thunderbird":  ("Thunderbird",            "Mozilla.Thunderbird",             ("thunderbird",)),
+    "filezilla":    ("FileZilla",              "FileZilla.FileZilla",             ("filezilla",)),
+    "winscp":       ("WinSCP",                 "WinSCP.WinSCP",                   None),
+    "anydesk":      ("AnyDesk",                "AnyDeskSoftwareGmbH.AnyDesk",     None),
+    "git":          ("Git",                    "Git.Git",                         ("git",)),
+    "vscode":       ("Visual Studio Code",     "Microsoft.VisualStudioCode",      None),
+    "python":       ("Python 3.14",            "Python.Python.3.14",              ("python3",)),
+    "python-venv":  ("Python virtualenv tools", None,                             ("python3-venv",)),
+    "github-cli":   ("GitHub CLI",             "GitHub.cli",                      None),
+    "node":         ("Node.js LTS",            "OpenJS.NodeJS.LTS",               ("nodejs",)),
+    "powertoys":    ("Microsoft PowerToys",    "Microsoft.PowerToys",             None),
+    "terminal":     ("Windows Terminal",       "Microsoft.WindowsTerminal",       None),
+    "obs":          ("OBS Studio",             "OBSProject.OBSStudio",            ("obs-studio",)),
+    "gimp":         ("GIMP",                   "GIMP.GIMP.3",                    ("gimp",)),
+    "audacity":     ("Audacity",               "Audacity.Audacity",               ("audacity",)),
+    "qbittorrent":  ("qBittorrent",            "qBittorrent.qBittorrent",         ("qbittorrent",)),
+    "keepassxc":    ("KeePassXC",              "KeePassXCTeam.KeePassXC",         ("keepassxc",)),
+    "flameshot":    ("Flameshot",              None,                              ("flameshot",)),
+    "curl":         ("curl",                   None,                              ("curl",)),
+    "htop":         ("htop",                   None,                              ("htop",)),
 }
 
-LINUX_CATALOG: Dict[str, Tuple[str, str]] = {
-    "p7zip": ("p7zip-full (7z support)", "p7zip-full"),
-    "rar": ("p7zip-rar (RAR support)", "p7zip-rar"),
-    "chromium": ("Chromium Browser", "chromium-browser"),
-    "firefox": ("Firefox", "firefox"),
-    "vlc": ("VLC Media Player", "vlc"),
-    "telegram": ("Telegram Desktop", "telegram-desktop"),
-    "geany": ("Geany (Editor)", "geany"),
-    "evince": ("Evince (PDF)", "evince"),
-    "codecs": ("Restricted Codecs", "ubuntu-restricted-extras"),
+WINDOWS_SETTINGS = {
+    "restore-point":     "تلاش برای ساخت Restore Point پیش از تغییرات",
+    "fast-startup-off":  "غیرفعال کردن Fast Startup؛ بدون غیرفعال کردن Hibernate",
+    "show-extensions":   "نمایش پسوند فایل‌ها در File Explorer",
+    "persian-standard":  "افزودن کیبورد Persian (Standard) برای کاربر فعلی",
+    "windows-update":    "باز کردن صفحه Windows Update برای بررسی دستی",
+    "activation":        "باز کردن صفحه وضعیت فعال‌سازی ویندوز",
 }
 
-PRESETS = {
-    "daily": ["7zip", "chrome", "vlc", "telegram", "notepadpp", "sumatra"],
-    # Linux daily preset will be auto-mapped to equivalents
+DAILY = {
+    "windows": ["7zip", "chrome", "vlc", "telegram", "sumatra", "libreoffice"],
+    "linux":   ["7zip", "firefox", "vlc", "telegram", "evince", "libreoffice"],
+}
+
+DEVELOPER_EXTRA = {
+    "windows": ["git", "vscode", "python", "github-cli", "terminal"],
+    "linux":   ["git", "python", "python-venv", "geany", "curl", "htop"],
 }
 
 
-# -------------------------
-# Utilities
-# -------------------------
+def get_log_path():
+    for directory in (Path.home(), Path(tempfile.gettempdir())):
+        path = directory / "setup_apps.log"
+        try:
+            path.touch(exist_ok=True)
+            return path
+        except OSError:
+            continue
+    return None
 
-LOG_FILE = "install.log"
+
+LOG_FILE = get_log_path()
 
 
-def log(msg: str) -> None:
-    ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}] {msg}"
-    print(line)
+def log(message):
+    print(message, flush=True)
+    if LOG_FILE:
+        try:
+            with LOG_FILE.open("a", encoding="utf-8") as file:
+                file.write(message + "\n")
+        except OSError:
+            pass
+
+
+def show_log_tail(lines=7):
+    if not LOG_FILE:
+        return
     try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        # If logging fails, continue silently.
+        from collections import deque
+        with LOG_FILE.open("r", encoding="utf-8", errors="replace") as file:
+            tail = deque(file, maxlen=lines)
+        for line in tail:
+            print("    " + line.rstrip())
+    except OSError:
         pass
 
 
-def run(cmd: List[str] | str, *, shell: bool = False, timeout: int | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        cmd,
-        shell=shell,
-        text=True,
-        capture_output=True,
-        timeout=timeout,
-    )
-
-
-def require_admin_or_root() -> None:
-    os_name = platform.system()
-    if os_name == "Windows":
-        try:
-            import ctypes
-            if ctypes.windll.shell32.IsUserAnAdmin() == 0:
-                raise PermissionError
-        except Exception:
-            log("ERROR: Please run Terminal/PowerShell as Administrator.")
-            sys.exit(1)
-    else:
-        if os.geteuid() != 0:
-            log("ERROR: Please run with sudo: sudo python3 setup_apps.py")
-            sys.exit(1)
-
-
-def have_command(cmd: str) -> bool:
-    return shutil.which(cmd) is not None
-
-
-def check_internet() -> bool:
-    # Lightweight connectivity check (DNS + HTTPS)
+def run_command(command, timeout=1800, env=None):
+    """Run a fixed argument list; never invoke a shell."""
+    log("COMMAND: " + subprocess.list2cmdline(command))
     try:
-        import socket
-        socket.setdefaulttimeout(3)
-        socket.gethostbyname("github.com")
-        return True
-    except Exception:
+        if LOG_FILE:
+            with LOG_FILE.open("a", encoding="utf-8", errors="replace") as file:
+                result = subprocess.run(
+                    command, stdout=file, stderr=subprocess.STDOUT,
+                    timeout=timeout, env=env, check=False
+                )
+        else:
+            result = subprocess.run(
+                command, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
+                timeout=timeout, env=env, check=False
+            )
+        if result.returncode != 0:
+            log("FAILED: exit code " + str(result.returncode))
+            show_log_tail()
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log("FAILED: " + str(exc))
         return False
 
 
-def detect_platform() -> str:
-    os_name = platform.system()
-    if os_name == "Windows":
+def detect_os():
+    name = platform.system()
+    if name == "Windows":
         return "windows"
-    if os_name == "Linux":
+    if name == "Linux":
         return "linux"
-    return "other"
+    return None
 
 
-# -------------------------
-# Catalog selection / mapping
-# -------------------------
-
-def get_catalog(os_key: str) -> Dict[str, Tuple[str, str]]:
-    return WINDOWS_CATALOG if os_key == "windows" else LINUX_CATALOG
+def supported_apps(os_name):
+    column = 1 if os_name == "windows" else 2
+    return {key: app for key, app in APPS.items() if app[column] is not None}
 
 
-def map_windows_preset_to_linux(keys: List[str]) -> List[str]:
-    """Map common Windows keys to Linux equivalents when possible."""
-    mapping = {
-        "7zip": "p7zip",
-        "chrome": "chromium",     # closest common default
-        "brave": "chromium",
-        "notepadpp": "geany",
-        "sumatra": "evince",
-        "foxit": "evince",
-        "potplayer": "vlc",
-    }
-    out = []
-    for k in keys:
-        out.append(mapping.get(k, k))
-    # de-dup while keeping order
-    seen = set()
-    dedup = []
-    for k in out:
-        if k not in seen:
-            seen.add(k)
-            dedup.append(k)
-    return dedup
+def is_debian_based():
+    try:
+        text = Path("/etc/os-release").read_text(encoding="utf-8").lower()
+        return bool(re.search(r"(?m)^id=(debian|ubuntu|linuxmint|parrot)$", text)
+                    or re.search(r"(?m)^id_like=.*\b(debian|ubuntu)\b", text))
+    except OSError:
+        return False
 
 
-# -------------------------
-# Interactive menu
-# -------------------------
+def is_windows_admin():
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except (AttributeError, OSError):
+        return False
 
-def interactive_select(os_key: str) -> List[str]:
-    catalog = get_catalog(os_key)
-    keys = list(catalog.keys())
 
-    selected = set()
+def preset_keys(os_name, preset):
+    if preset == "full":
+        return list(supported_apps(os_name))
+    keys = list(DAILY[os_name])
+    if preset == "developer":
+        keys += DEVELOPER_EXTRA[os_name]
+    return list(dict.fromkeys(keys))
 
-    def render() -> None:
-        print("\n" + "=" * 70)
-        print("Interactive installer - select packages")
-        print("Type numbers separated by space to toggle, or commands:")
-        print("  a=all, n=none, i=install, q=quit")
-        print("=" * 70)
-        for idx, k in enumerate(keys, start=1):
-            name, pkg = catalog[k]
-            mark = "✓" if k in selected else " "
-            print(f"{idx:>2}. [{mark}] {k:<10} - {name} ({pkg})")
-        print("=" * 70)
+
+def select_menu(title, entries, defaults=()):
+    keys = list(entries)
+    selected = set(defaults) & set(keys)
 
     while True:
-        render()
-        s = input("Selection> ").strip().lower()
-        if s in ("q", "quit", "exit"):
-            log("User quit.")
-            sys.exit(0)
-        if s in ("a", "all"):
+        print("\n" + title)
+        print("-" * 65)
+        for number, key in enumerate(keys, 1):
+            mark = "x" if key in selected else " "
+            print(f"{number:>2}. [{mark}] {key:<20} {entries[key]}")
+        print("شماره‌ها را با فاصله یا ویرگول وارد کن.")
+        print("a=همه | n=هیچ‌کدام | d=پیش‌فرض | i=ادامه | q=خروج")
+
+        try:
+            answer = input("> ").strip().lower()
+        except EOFError:
+            raise SystemExit("ورودی تعاملی در دسترس نیست؛ از --preset استفاده کن.")
+
+        if answer == "q":
+            raise SystemExit(0)
+        if answer == "a":
             selected = set(keys)
-            continue
-        if s in ("n", "none", "clear"):
-            selected = set()
-            continue
-        if s in ("i", "install", "go"):
-            if not selected:
-                print("Nothing selected.")
-                continue
-            return list(selected)
-
-        # Toggle numeric selections
-        parts = s.split()
-        any_toggle = False
-        for p in parts:
-            if not p.isdigit():
-                continue
-            idx = int(p)
-            if 1 <= idx <= len(keys):
-                k = keys[idx - 1]
-                if k in selected:
-                    selected.remove(k)
-                else:
-                    selected.add(k)
-                any_toggle = True
-        if not any_toggle:
-            print("Invalid input. Example: '1 3 5' or 'a' or 'i'.")
-
-
-# -------------------------
-# Installers
-# -------------------------
-
-def winget_install(pkg_id: str, name: str, *, dry_run: bool) -> bool:
-    cmd = [
-        "winget", "install",
-        "--id", pkg_id,
-        "-e",
-        "--silent",
-        "--accept-package-agreements",
-        "--accept-source-agreements",
-    ]
-    if dry_run:
-        log(f"DRY-RUN winget: {' '.join(cmd)}")
-        return True
-
-    log(f"Installing (winget): {name}")
-    p = subprocess.run(cmd, text=True, capture_output=True)
-    if p.returncode == 0:
-        log(f"OK: {name}")
-        return True
-
-    log(f"FAIL: {name} (code={p.returncode})")
-    if p.stdout:
-        log("STDOUT:\n" + p.stdout.strip())
-    if p.stderr:
-        log("STDERR:\n" + p.stderr.strip())
-    return False
-
-
-def apt_install(pkg_name: str, name: str, *, dry_run: bool) -> bool:
-    cmd = ["bash", "-lc", f"DEBIAN_FRONTEND=noninteractive apt-get install -y {pkg_name}"]
-    if dry_run:
-        log(f"DRY-RUN apt: {cmd[-1]}")
-        return True
-
-    log(f"Installing (apt): {name}")
-    p = subprocess.run(cmd, text=True, capture_output=True)
-    if p.returncode == 0:
-        log(f"OK: {name}")
-        return True
-
-    log(f"FAIL: {name} (code={p.returncode})")
-    if p.stdout:
-        log("STDOUT:\n" + p.stdout.strip())
-    if p.stderr:
-        log("STDERR:\n" + p.stderr.strip())
-    return False
-
-
-def preflight(os_key: str) -> None:
-    log(f"Detected OS: {os_key}")
-
-    if not check_internet():
-        log("WARNING: Internet seems unavailable. Installs may fail.")
-
-    if os_key == "windows":
-        if not have_command("winget"):
-            log("ERROR: winget not found. Install/Update 'App Installer' from Microsoft Store.")
-            sys.exit(1)
-    elif os_key == "linux":
-        if not have_command("apt-get"):
-            log("ERROR: apt-get not found. This script supports Debian/Ubuntu-based distros.")
-            sys.exit(1)
-    else:
-        log("ERROR: Unsupported OS.")
-        sys.exit(1)
-
-
-def install_selected(os_key: str, keys: List[str], *, dry_run: bool) -> None:
-    catalog = get_catalog(os_key)
-
-    ok = 0
-    fail = 0
-
-    if os_key == "linux" and not dry_run:
-        log("Running apt-get update...")
-        u = subprocess.run(["bash", "-lc", "apt-get update -y"], text=True, capture_output=True)
-        if u.returncode != 0:
-            log("WARNING: apt-get update failed; continuing anyway.")
-
-    for k in keys:
-        if k not in catalog:
-            log(f"SKIP: unknown package key '{k}'")
-            fail += 1
-            continue
-
-        name, pkg = catalog[k]
-        if os_key == "windows":
-            if winget_install(pkg, name, dry_run=dry_run):
-                ok += 1
-            else:
-                fail += 1
+        elif answer == "n":
+            selected.clear()
+        elif answer == "d":
+            selected = set(defaults) & set(keys)
+        elif answer == "i":
+            return [key for key in keys if key in selected]
         else:
-            if apt_install(pkg, name, dry_run=dry_run):
-                ok += 1
+            parts = answer.replace(",", " ").split()
+            if not parts or any(not p.isdigit() or
+                                not 1 <= int(p) <= len(keys) for p in parts):
+                print("ورودی نامعتبر است؛ مثلاً: 1 3 5")
+                continue
+            for part in parts:
+                key = keys[int(part) - 1]
+                if key in selected:
+                    selected.remove(key)
+                else:
+                    selected.add(key)
+
+
+def apt_installed(package):
+    result = subprocess.run(
+        ["dpkg-query", "-W", "-f=${Status}", package],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, check=False
+    )
+    return result.returncode == 0 and result.stdout.strip() == "install ok installed"
+
+
+def apt_available(package):
+    env = os.environ.copy()
+    env["LC_ALL"] = "C"
+    result = subprocess.run(
+        ["apt-cache", "policy", package],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, env=env, check=False
+    )
+    return result.returncode == 0 and bool(
+        re.search(r"(?m)^\s*Candidate:\s*(?!\(none\))\S+", result.stdout)
+    )
+
+
+def winget_installed(package_id):
+    """Best-effort detection; winget --no-upgrade also protects reruns."""
+    try:
+        result = subprocess.run(
+            ["winget", "list", "--id", package_id, "--exact"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, errors="replace", timeout=90, check=False
+        )
+        pattern = r"\s+" + re.escape(package_id) + r"\s+\S+"
+        return result.returncode == 0 and any(
+            re.search(pattern, line) for line in result.stdout.splitlines()
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def install_windows(key, dry_run):
+    name, package_id, _ = APPS[key]
+    command = [
+        "winget", "install", "--id", package_id, "--exact",
+        "--source", "winget", "--silent", "--no-upgrade",
+        "--accept-package-agreements", "--accept-source-agreements",
+    ]
+
+    if dry_run:
+        log("DRY RUN: " + name + " -> " + subprocess.list2cmdline(command))
+        return "preview"
+
+    if winget_installed(package_id):
+        log("SKIP: " + name + " is already installed.")
+        return "skip"
+
+    log("INSTALL: " + name)
+    if run_command(command):
+        log("OK: " + name)
+        return "ok"
+
+    # An existing application may have caused a nonzero winget exit code.
+    if winget_installed(package_id):
+        log("SKIP: " + name + " is already present.")
+        return "skip"
+
+    return "fail"
+
+
+def install_linux(key, dry_run):
+    name, _, candidates = APPS[key]
+
+    if dry_run:
+        log("DRY RUN: " + name + " -> apt candidates: " +
+            ", ".join(candidates))
+        return "preview"
+
+    for package in candidates:
+        if apt_installed(package):
+            log("SKIP: " + name + " is already installed (" + package + ").")
+            return "skip"
+
+    package = next((p for p in candidates if apt_available(p)), None)
+    if package is None:
+        log("FAILED: no apt candidate for " + name +
+            " (" + ", ".join(candidates) + ").")
+        return "fail"
+
+    log("INSTALL: " + name + " (" + package + ")")
+    env = os.environ.copy()
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+    command = ["apt-get", "install", "-y", package]
+    if run_command(command, env=env):
+        log("OK: " + name)
+        return "ok"
+    return "fail"
+
+
+def registry_dword(root, subkey, name, value):
+    import winreg
+
+    with winreg.CreateKeyEx(root, subkey, 0, winreg.KEY_READ | winreg.KEY_WRITE) as key:
+        try:
+            previous, _ = winreg.QueryValueEx(key, name)
+        except FileNotFoundError:
+            previous = None
+
+        if previous == value:
+            log("SKIP: setting already has the requested value.")
+            return "skip"
+
+        log(f"REGISTRY: {subkey}\\{name}: {previous!r} -> {value!r}")
+        winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, value)
+        return "ok"
+
+
+def apply_windows_setting(key, dry_run):
+    if dry_run:
+        log("DRY RUN: Windows setting -> " + key)
+        return "preview"
+
+    if key in ("windows-update", "activation"):
+        uri = ("ms-settings:windowsupdate" if key == "windows-update"
+               else "ms-settings:activation")
+        try:
+            os.startfile(uri)
+            log("OPENED: " + uri + " (no update or activation performed)")
+            return "ok"
+        except OSError as exc:
+            log("FAILED: " + str(exc))
+            return "fail"
+
+    if key == "show-extensions":
+        try:
+            import winreg
+            return registry_dword(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced",
+                "HideFileExt", 0
+            )
+        except OSError as exc:
+            log("FAILED: " + str(exc))
+            return "fail"
+
+    if key == "persian-standard":
+        # Preserve existing display languages and keyboard layouts.
+        script = (
+            "$ErrorActionPreference='Stop'; "
+            "$list=Get-WinUserLanguageList; "
+            "$fa=$list | Where-Object LanguageTag -EQ 'fa-IR' | "
+            "Select-Object -First 1; "
+            "$changed=$false; "
+            "if($null -eq $fa) { "
+            "$list.Add('fa-IR'); "
+            "$fa=$list | Where-Object LanguageTag -EQ 'fa-IR' | "
+            "Select-Object -First 1; "
+            "$fa.InputMethodTips.Clear(); $changed=$true }; "
+            "if(-not $fa.InputMethodTips.Contains('0429:00050429')) { "
+            "$fa.InputMethodTips.Add('0429:00050429'); $changed=$true }; "
+            "if($changed) { Set-WinUserLanguageList -LanguageList $list -Force }"
+        )
+        return ("ok" if run_command(
+            ["powershell.exe", "-NoProfile", "-NonInteractive",
+             "-Command", script], timeout=180
+        ) else "fail")
+
+    if not is_windows_admin():
+        log("FAILED: " + key + " requires an Administrator terminal.")
+        return "fail"
+
+    if key == "fast-startup-off":
+        try:
+            import winreg
+            return registry_dword(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SYSTEM\CurrentControlSet\Control\Session Manager\Power",
+                "HiberbootEnabled", 0
+            )
+        except OSError as exc:
+            log("FAILED: " + str(exc))
+            return "fail"
+
+    if key == "restore-point":
+        script = (
+            "$ErrorActionPreference='Stop'; "
+            "Checkpoint-Computer -Description 'Before setup_apps changes' "
+            "-RestorePointType 'MODIFY_SETTINGS'"
+        )
+        return ("ok" if run_command(
+            ["powershell.exe", "-NoProfile", "-NonInteractive",
+             "-Command", script], timeout=900
+        ) else "fail")
+
+    return "fail"
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Choose apps and post-install settings.")
+    parser.add_argument("--list", action="store_true", help="List apps for this OS.")
+    parser.add_argument("--list-settings", action="store_true",
+                        help="List optional Windows settings.")
+    parser.add_argument("--preset", choices=["daily", "developer", "full"])
+    parser.add_argument("--install", nargs="+", metavar="APP")
+    parser.add_argument("--settings", nargs="+", metavar="SETTING")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Preview without installing or changing settings.")
+    parser.add_argument("--yes", action="store_true",
+                        help="Skip final confirmation.")
+    return parser, parser.parse_args()
+
+
+def main():
+    os_name = detect_os()
+    if os_name is None:
+        print("Only Windows and Debian-based Linux are supported.")
+        return 2
+
+    parser, args = parse_arguments()
+    available = supported_apps(os_name)
+
+    if args.list or args.list_settings:
+        if args.list:
+            print("\nAvailable applications:")
+            for key, app in available.items():
+                print(f"  {key:<20} {app[0]}")
+        if args.list_settings:
+            if os_name != "windows":
+                print("\nWindows settings do not apply to Linux.")
             else:
-                fail += 1
+                print("\nOptional Windows settings:")
+                for key, description in WINDOWS_SETTINGS.items():
+                    print(f"  {key:<20} {description}")
+        return 0
 
-    log(f"Done. Success={ok}, Failed={fail}. Log saved to: {os.path.abspath(LOG_FILE)}")
+    if args.preset and args.install:
+        parser.error("Use either --preset or --install, not both.")
 
+    if args.install:
+        unknown = [key for key in args.install if key not in available]
+        if unknown:
+            parser.error("Unavailable app key(s): " + ", ".join(unknown))
 
-# -------------------------
-# CLI
-# -------------------------
+    if args.settings:
+        if os_name != "windows":
+            parser.error("--settings is available on Windows only.")
+        unknown = [key for key in args.settings if key not in WINDOWS_SETTINGS]
+        if unknown:
+            parser.error("Unknown setting(s): " + ", ".join(unknown))
 
-def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(add_help=True)
-    ap.add_argument("--list", action="store_true", help="List available package keys for this OS and exit.")
-    ap.add_argument("--preset", choices=sorted(PRESETS.keys()), help="Install a predefined set.")
-    ap.add_argument("--install", nargs="*", help="Install by keys, e.g. --install chrome 7zip vlc")
-    ap.add_argument("--interactive", action="store_true", help="Interactive menu selection (default if no args).")
-    ap.add_argument("--dry-run", action="store_true", help="Print commands without executing them.")
-    return ap.parse_args()
+    interactive = not (args.preset or args.install or args.settings)
 
-
-def main() -> None:
-    os_key = detect_platform()
-    require_admin_or_root()
-    preflight(os_key)
-
-    args = parse_args()
-
-    if args.list:
-        cat = get_catalog(os_key)
-        print("\nAvailable packages:")
-        for k, (name, pkg) in cat.items():
-            print(f"  {k:<10} -> {name} ({pkg})")
-        sys.exit(0)
-
-    # Decide selection
-    selected_keys: List[str] = []
-
-    if args.preset:
-        keys = PRESETS[args.preset]
-        if os_key == "linux":
-            keys = map_windows_preset_to_linux(keys)
-        selected_keys = keys
-
-    elif args.install is not None and len(args.install) > 0:
-        selected_keys = args.install
-
+    if interactive:
+        app_labels = {key: app[0] for key, app in available.items()}
+        apps = select_menu(
+            "برنامه‌ها را انتخاب کن:",
+            app_labels,
+            defaults=preset_keys(os_name, "daily")
+        )
+        settings = (
+            select_menu("تنظیمات اختیاری ویندوز را انتخاب کن:",
+                        WINDOWS_SETTINGS)
+            if os_name == "windows" else []
+        )
     else:
-        # default interactive
-        selected_keys = interactive_select(os_key)
+        apps = (preset_keys(os_name, args.preset) if args.preset
+                else list(dict.fromkeys(args.install or [])))
+        settings = list(dict.fromkeys(args.settings or []))
 
-    install_selected(os_key, selected_keys, dry_run=args.dry_run)
+    if not apps and not settings:
+        print("هیچ کاری انتخاب نشده است.")
+        return 0
+
+    print("\nSelected apps:", ", ".join(apps) or "none")
+    print("Selected settings:", ", ".join(settings) or "none")
+    print("Mode:", "PREVIEW" if args.dry_run else "APPLY")
+    print("Log:", LOG_FILE or "unavailable")
+
+    if not args.dry_run and not args.yes:
+        if input("ادامه بدهم؟ [y/N] ").strip().lower() not in ("y", "yes"):
+            print("انصراف داده شد.")
+            return 0
+
+    if not args.dry_run:
+        if apps and os_name == "windows" and not shutil.which("winget"):
+            log("ERROR: winget not found; update/install Windows App Installer.")
+            return 2
+
+        if apps and os_name == "linux":
+            if not is_debian_based():
+                log("ERROR: this Linux distribution is not Debian-based.")
+                return 2
+            if not all(shutil.which(p) for p in
+                       ("apt-get", "apt-cache", "dpkg-query")):
+                log("ERROR: apt tools are missing.")
+                return 2
+            if os.geteuid() != 0:
+                log("ERROR: run with sudo for apt installations.")
+                return 2
+
+    results = []
+
+    # A selected restore point must run before installations and other settings.
+    if os_name == "windows" and "restore-point" in settings:
+        log("\nSETTING: restore-point")
+        results.append(apply_windows_setting("restore-point", args.dry_run))
+        settings.remove("restore-point")
+
+    if apps and os_name == "linux" and not args.dry_run:
+        log("\nUpdating apt package indexes...")
+        if not run_command(["apt-get", "update"], timeout=900):
+            log("WARNING: apt update failed; using cached indexes if available.")
+
+    for key in apps:
+        if os_name == "windows":
+            results.append(install_windows(key, args.dry_run))
+        else:
+            results.append(install_linux(key, args.dry_run))
+
+    for key in settings:
+        log("\nSETTING: " + key)
+        results.append(apply_windows_setting(key, args.dry_run))
+
+    log(
+        "\nFinished. "
+        + " | ".join(f"{status}={results.count(status)}"
+                   for status in ("ok", "skip", "preview", "fail"))
+    )
+    log("Log file: " + str(LOG_FILE))
+    return 1 if "fail" in results else 0
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nStopped by user.")
+        sys.exit(130)
